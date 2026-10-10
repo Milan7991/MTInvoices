@@ -290,6 +290,14 @@ body.measuring .preview{display:block!important;position:absolute;left:-10000px;
   </div>
 </dialog>
 
+<dialog id="dShare" style="width:min(380px,calc(100vw - 32px))">
+  <div class="dlg-body" style="text-align:center">
+    <h3 style="margin:0;font-family:'Bricolage Grotesque',sans-serif">Your PDF is ready</h3>
+    <div class="hint">Tap Share and pick WhatsApp.</div>
+    <button class="btn primary" id="bShareNow" style="justify-content:center">Share</button>
+    <button class="btn ghost" id="bShareDl" style="justify-content:center">Download instead</button>
+  </div>
+</dialog>
 <dialog id="dSet">
   <div class="dlg-head"><h3>Shop settings</h3><button class="btn ghost" data-close>Close</button></div>
   <div class="dlg-body">
@@ -654,13 +662,82 @@ function printInvoice(){
   document.title = prev;
 }
 
-function whatsapp(){
-  const c = calc(inv);
-  const lines = c.lines.map(l => `• ${l.name} × ${l.q}`).join('\n');
-  const msg = `*${S.name}*\nTax Invoice ${inv.no} dated ${dmy(inv.date)}\n\n${lines}\n\nTaxable: ₹${fmt(c.taxable)}\nGST: ₹${fmt(c.cgst+c.sgst+c.igst)}\n*Total: ${fmt0(c.total)}*\n\n${S.upi ? 'UPI: '+S.upi+'\n' : ''}Bank: ${S.bank}, A/c ${S.acno}, IFSC ${S.ifsc}\n\nThank you!`;
+/* ---------- PDF + WhatsApp ---------- */
+const LIBS = ['https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+              'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'];
+let libsReady;
+function loadPdfLibs(){
+  return libsReady ||= Promise.all(LIBS.map(src => new Promise((ok, fail) => {
+    const sc = document.createElement('script'); sc.src = src; sc.onload = ok;
+    sc.onerror = () => { libsReady = null; fail(new Error('offline')); };
+    document.head.appendChild(sc);
+  })));
+}
+const pdfName = () => `${inv.no} ${inv.cust.name}`.trim().replace(/[\\/:*?"<>|]+/g, '') + '.pdf';
+
+async function makePdf(){
+  await loadPdfLibs();
+  await (document.fonts ? document.fonts.ready : null);
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({unit:'mm', format:'a4', compress:true});
+  const n = document.querySelectorAll('#pages .sheet').length;
+  for (let i = 0; i < n; i++) {
+    const canvas = await html2canvas(document.querySelectorAll('#pages .sheet')[i], {
+      scale: 2, backgroundColor: '#ffffff', logging: false,
+      onclone: d => {
+        // Capture the pages at full size, even when the preview is hidden or scaled down
+        d.body.classList.add('show-preview');
+        d.getElementById('pages').style.transform = 'none';
+        d.querySelectorAll('.sheet').forEach(s => s.style.boxShadow = 'none');
+      }
+    });
+    if (i) doc.addPage();
+    doc.addImage(canvas.toDataURL('image/jpeg', 0.9), 'JPEG', 0, 0, 210, 297);
+  }
+  return new File([doc.output('blob')], pdfName(), {type:'application/pdf'});
+}
+
+function waNumber(){
   let ph = (inv.cust.phone||'').replace(/\D/g,'');
   if (ph.length === 10) ph = '91' + ph;
-  window.open(`https://wa.me/${ph}?text=${encodeURIComponent(msg)}`, '_blank');
+  return ph;
+}
+function downloadFile(file){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file); a.download = file.name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+let sharing = false;
+async function whatsapp(){
+  if (sharing) return;
+  const c = calc(inv);
+  if (!c.lines.length) { toast('Add at least one item before sharing'); return; }
+  sharing = true; toast('Preparing PDF…');
+  let file;
+  try { file = await makePdf(); }
+  catch (e) { sharing = false; toast(e.message === 'offline' ? 'Connect to the internet once to make PDFs' : 'Could not make the PDF. Try Print / PDF instead.'); return; }
+  sharing = false;
+  const caption = `Tax Invoice ${inv.no} from ${S.name}. Total ${fmt0(c.total)}.`;
+
+  if (navigator.canShare && navigator.canShare({files:[file]})) {
+    try { await navigator.share({files:[file], title:file.name, text:caption}); }
+    catch (e) {
+      if (e.name === 'AbortError') return;          // closed the share sheet
+      showShareReady(file, caption);                 // browser wants a fresh tap
+    }
+    return;
+  }
+  // Computers can't attach files to WhatsApp from a web page: download it and open the chat.
+  downloadFile(file);
+  window.open(`https://wa.me/${waNumber()}?text=${encodeURIComponent(caption)}`, '_blank');
+  toast('PDF downloaded. Attach it in the WhatsApp chat.');
+}
+function showShareReady(file, caption){
+  const d = $('#dShare');
+  $('#bShareNow').onclick = async () => { d.close(); try { await navigator.share({files:[file], title:file.name, text:caption}); } catch(e){} };
+  $('#bShareDl').onclick = () => { d.close(); downloadFile(file); };
+  d.showModal();
 }
 
 /* ---------- History ---------- */
@@ -796,7 +873,7 @@ window.addEventListener('beforeprint', () => { $('#pages').style.transform='none
 $('#brandName').textContent = S.name.split(',')[0];
 bindInvoiceFields(); renderItems(); renderQuick(); update();
 document.fonts && document.fonts.ready.then(renderSheet);
-window.addEventListener('load', () => renderSheet());
+window.addEventListener('load', () => { renderSheet(); setTimeout(() => loadPdfLibs().catch(()=>{}), 1500); });
 </script>
 </body>
 </html>
