@@ -293,8 +293,8 @@ body.measuring .preview{display:block!important;position:absolute;left:-10000px;
 <dialog id="dShare" style="width:min(380px,calc(100vw - 32px))">
   <div class="dlg-body" style="text-align:center">
     <h3 style="margin:0;font-family:'Bricolage Grotesque',sans-serif">Your PDF is ready</h3>
-    <div class="hint">Tap Share and pick WhatsApp.</div>
-    <button class="btn primary" id="bShareNow" style="justify-content:center">Share</button>
+    <div class="hint">Tap Share on WhatsApp, then pick WhatsApp from the list.</div>
+    <button class="btn primary" id="bShareNow" style="justify-content:center">Share on WhatsApp</button>
     <button class="btn ghost" id="bShareDl" style="justify-content:center">Download instead</button>
   </div>
 </dialog>
@@ -594,6 +594,7 @@ function renderSheet(){
   $('#tBig').textContent = $('#mBig').textContent = fmt0(c.total);
   const taxSum = c.cgst + c.sgst + c.igst;
   $('#tSub').innerHTML = `Taxable ₹${fmt(c.taxable)}<br>GST ₹${fmt(taxSum)}`;
+  schedulePdf();
   $('#mSub').textContent = `incl. GST ₹${fmt(taxSum)}` + (pages.length > 1 ? `, ${pages.length} pages` : '');
   fitSheet();
 }
@@ -673,7 +674,7 @@ function loadPdfLibs(){
     document.head.appendChild(sc);
   })));
 }
-const pdfName = () => `${inv.no} ${inv.cust.name}`.trim().replace(/[\\/:*?"<>|]+/g, '') + '.pdf';
+const pdfName = () => `${inv.no} ${inv.cust.name}`.trim().replace(/[^A-Za-z0-9-]+/g, '_').replace(/_+$/,'') + '.pdf';
 
 async function makePdf(){
   await loadPdfLibs();
@@ -708,34 +709,61 @@ function downloadFile(file){
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-let sharing = false;
-async function whatsapp(){
-  if (sharing) return;
-  const c = calc(inv);
-  if (!c.lines.length) { toast('Add at least one item before sharing'); return; }
-  sharing = true; toast('Preparing PDF…');
-  let file;
-  try { file = await makePdf(); }
-  catch (e) { sharing = false; toast(e.message === 'offline' ? 'Connect to the internet once to make PDFs' : 'Could not make the PDF. Try Print / PDF instead.'); return; }
-  sharing = false;
-  const caption = `Tax Invoice ${inv.no} from ${S.name}. Total ${fmt0(c.total)}.`;
+// Build the PDF in the background after edits, so tapping WhatsApp can share it at once.
+// Android only opens the share sheet straight after a tap; a slow PDF build in between makes it refuse.
+const pdfCache = {key:'', file:null};
+let pdfBuilding = null, pdfTimer;
+const pdfKey = () => JSON.stringify([inv, S]);
+function schedulePdf(){
+  clearTimeout(pdfTimer);
+  if (!calc(inv).lines.length) return;
+  pdfTimer = setTimeout(buildPdf, 1500);
+}
+async function buildPdf(){
+  if (pdfBuilding) return pdfBuilding;
+  const key = pdfKey();
+  if (pdfCache.key === key && pdfCache.file) return pdfCache.file;
+  pdfBuilding = makePdf().then(file => {
+    pdfCache.key = key; pdfCache.file = file; return file;
+  }).finally(() => {
+    pdfBuilding = null;
+    if (pdfCache.key !== pdfKey()) schedulePdf();   // edited while building
+  });
+  return pdfBuilding;
+}
+const readyPdf = () => pdfCache.key === pdfKey() ? pdfCache.file : null;
+const canShareFile = f => !!(navigator.canShare && navigator.canShare({files:[f]}));
 
-  if (navigator.canShare && navigator.canShare({files:[file]})) {
-    try { await navigator.share({files:[file], title:file.name, text:caption}); }
-    catch (e) {
-      if (e.name === 'AbortError') return;          // closed the share sheet
-      showShareReady(file, caption);                 // browser wants a fresh tap
-    }
-    return;
-  }
+function shareFile(file){
+  // Files only: adding title/text alongside a file makes some Android apps reject the share.
+  return navigator.share({files:[file]}).catch(e => {
+    if (e.name === 'AbortError') return;          // closed the share sheet
+    toast(`Sharing didn't work (${e.name}). Use Download instead.`);
+    showShareReady(file);
+  });
+}
+
+async function whatsapp(){
+  if (!calc(inv).lines.length) { toast('Add at least one item before sharing'); return; }
+  const ready = readyPdf();
+  if (ready && canShareFile(ready)) { clearTimeout(pdfTimer); shareFile(ready); return; }   // no waiting between tap and share
+
+  toast('Preparing PDF…');
+  let file;
+  try { file = await buildPdf(); if (pdfCache.key !== pdfKey()) file = await buildPdf(); }
+  catch (e) { toast(e.message === 'offline' ? 'Connect to the internet once to make PDFs' : 'Could not make the PDF. Try Print / PDF instead.'); return; }
+
+  if (canShareFile(file)) { showShareReady(file); return; }   // ask for a fresh tap to share
   // Computers can't attach files to WhatsApp from a web page: download it and open the chat.
   downloadFile(file);
+  const caption = `Tax Invoice ${inv.no} from ${S.name}. Total ${fmt0(calc(inv).total)}.`;
   window.open(`https://wa.me/${waNumber()}?text=${encodeURIComponent(caption)}`, '_blank');
   toast('PDF downloaded. Attach it in the WhatsApp chat.');
 }
-function showShareReady(file, caption){
+function showShareReady(file){
   const d = $('#dShare');
-  $('#bShareNow').onclick = async () => { d.close(); try { await navigator.share({files:[file], title:file.name, text:caption}); } catch(e){} };
+  $('#bShareNow').hidden = !canShareFile(file);
+  $('#bShareNow').onclick = () => { d.close(); shareFile(file); };
   $('#bShareDl').onclick = () => { d.close(); downloadFile(file); };
   d.showModal();
 }
